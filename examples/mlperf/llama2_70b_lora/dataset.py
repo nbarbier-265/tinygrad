@@ -1,216 +1,87 @@
-import json
-import random
+# GovReport dataset for Llama2 summarization task
+import json, random
 from pathlib import Path
-from typing import Dict, List, Iterator
 from tinygrad import Tensor
 
-LABEL_IGNORE_INDEX = -100
-INSTRUCTION_PROMPT_TEMPLATE = "Summarize the following government document:\n\n{input}\n\nSummary:"
+IGNORE_IDX = -100
+PROMPT = "Summarize the following government document:\n\n{input}\n\nSummary:"
 
-class GovReportExample:
-    def __init__(self, input_text: str, output_text: str, example_id: str | int):
-        self.input_text = input_text
-        self.output_text = output_text
-        self.example_id = example_id
+class Dataset:
+  def __init__(self, path, tok, maxlen=8192, split="train"):
+    self.path, self.tok, self.maxlen, self.split = Path(path), tok, maxlen, split
+    self.data = self._load()
+    print(f"loaded {len(self.data)} {split} examples")
+  def _load(self):
+    f = self.path / f"{self.split}.json"
+    if not f.exists(): self._create_dummy()
+    return json.load(open(f))
+  def _create_dummy(self):
+    self.path.mkdir(parents=True, exist_ok=True)
+    dummy = [{"input": "Sample government policy report. "*50, "output": "Policy implementation summary.", "id": f"d{i}"} for i in range(10)]
+    for s in ["train", "validation", "test"]: json.dump(dummy, open(self.path/f"{s}.json",'w'), indent=2)
+    print(f"created dummy data: {len(dummy)} examples/split")
+  def __len__(self): return len(self.data)
+  def __getitem__(self, i): return self.data[i]
+  def tokenize(self, ex): # tokenize with labels for training
+    inp_toks = [self.tok.bos_token_id] + self.tok.encode(PROMPT.format(input=ex['input']))
+    tgt_toks = self.tok.encode(ex['output'])
+    toks = inp_toks + tgt_toks + [self.tok.eos_token_id]
+    if len(toks) > self.maxlen: toks = toks[:self.maxlen]
+    labels = [IGNORE_IDX]*len(inp_toks) + tgt_toks + [self.tok.eos_token_id] # mask prompt, only train on completion
+    if len(labels) > self.maxlen: labels = labels[:self.maxlen]
+    alen = min(len(toks), len(labels))
+    attn = [1]*alen + [0]*(self.maxlen-alen)
+    toks += [self.tok.pad_token_id]*(self.maxlen-len(toks))
+    labels += [IGNORE_IDX]*(self.maxlen-len(labels))
+    return {'input_ids': toks, 'attention_mask': attn, 'labels': labels}
+  def collate(self, batch):
+    b = [self.tokenize(ex) for ex in batch]
+    return {
+      'input_ids': Tensor([x['input_ids'] for x in b], dtype='int32'),
+      'attention_mask': Tensor([x['attention_mask'] for x in b], dtype='int32'),
+      'labels': Tensor([x['labels'] for x in b], dtype='int32')
+    }
 
-class GovReportDataset:
-    def __init__(self, data_path: str, tokenizer, max_length: int = 8192, split: str = "train"):
-        self.data_path = Path(data_path)
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.split = split
-        self.examples = self._load_examples()
-        print(f"Loaded {len(self.examples)} examples for {split} split")
-    
-    def _load_examples(self) -> List[GovReportExample]:
-        split_file = self.data_path / f"{self.split}.json"
-        
-        if not split_file.exists():
-            self._create_dummy_data()
-        
-        with open(split_file, 'r', encoding='utf-8') as f:
-            raw_data = json.load(f)
-        
-        return [
-            GovReportExample(
-                input_text=item['input'],
-                output_text=item['output'],
-                example_id=item.get('id', idx)
-            )
-            for idx, item in enumerate(raw_data)
-        ]
-    
-    def _create_dummy_data(self):
-        self.data_path.mkdir(parents=True, exist_ok=True)
-        dummy_examples = [
-            {
-                "input": "This is a sample government report about policy implementation. " * 50,
-                "output": "This report discusses policy implementation challenges and recommendations.",
-                "id": f"dummy_{i}"
-            }
-            for i in range(10)
-        ]
-        
-        for split_name in ["train", "validation", "test"]:
-            output_file = self.data_path / f"{split_name}.json"
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(dummy_examples, f, ensure_ascii=False, indent=2)
-        print(f"Created dummy data: {len(dummy_examples)} examples per split")
-    
-    def __len__(self) -> int:
-        return len(self.examples)
-    
-    def __getitem__(self, idx: int) -> GovReportExample:
-        return self.examples[idx]
-    
-    def _tokenize_example(self, example: GovReportExample) -> Dict[str, List[int]]:
-        prompt = INSTRUCTION_PROMPT_TEMPLATE.format(input=example.input_text)
-        
-        # The SimpleTokenizer.encode() method doesn't take add_special_tokens parameter
-        # We need to manually add special tokens
-        input_tokens = [self.tokenizer.bos_token_id] + self.tokenizer.encode(prompt)
-        target_tokens = self.tokenizer.encode(example.output_text)
-        
-        combined_tokens = input_tokens + target_tokens + [self.tokenizer.eos_token_id]
-        
-        if len(combined_tokens) > self.max_length:
-            combined_tokens = combined_tokens[:self.max_length]
-        
-        input_length = len(input_tokens)
-        label_tokens = [LABEL_IGNORE_INDEX] * input_length + target_tokens + [self.tokenizer.eos_token_id]
-        
-        if len(label_tokens) > self.max_length:
-            label_tokens = label_tokens[:self.max_length]
-        
-        actual_length = min(len(combined_tokens), len(label_tokens))
-        attention_mask = [1] * actual_length + [0] * (self.max_length - actual_length)
-        
-        combined_tokens += [self.tokenizer.pad_token_id] * (self.max_length - len(combined_tokens))
-        label_tokens += [LABEL_IGNORE_INDEX] * (self.max_length - len(label_tokens))
-        
-        return {
-            'input_ids': combined_tokens,
-            'attention_mask': attention_mask,
-            'labels': label_tokens
-        }
-    
-    def collate_fn(self, batch: List[GovReportExample]) -> Dict[str, Tensor]:
-        tokenized_batch = [self._tokenize_example(example) for example in batch]
-        
-        return {
-            'input_ids': Tensor([item['input_ids'] for item in tokenized_batch], dtype='int32'),
-            'attention_mask': Tensor([item['attention_mask'] for item in tokenized_batch], dtype='int32'),
-            'labels': Tensor([item['labels'] for item in tokenized_batch], dtype='int32')
-        }
+class DataLoader:
+  def __init__(self, ds, bs=1, shuffle=True, drop_last=True):
+    self.ds, self.bs, self.shuffle, self.drop_last = ds, bs, shuffle, drop_last
+    self.idxs = list(range(len(ds)))
+  def __len__(self): return len(self.ds)//self.bs if self.drop_last else (len(self.ds)+self.bs-1)//self.bs
+  def __iter__(self):
+    if self.shuffle: random.shuffle(self.idxs)
+    for i in range(0, len(self.ds), self.bs):
+      bidx = self.idxs[i:i+self.bs]
+      if self.drop_last and len(bidx)<self.bs: continue
+      yield self.ds.collate([self.ds[j] for j in bidx])
 
-class GovReportDataLoader:
-    def __init__(self, dataset: GovReportDataset, batch_size: int = 1, shuffle: bool = True, drop_last: bool = True):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.drop_last = drop_last
-        self.indices = list(range(len(dataset)))
-    
-    def __len__(self) -> int:
-        if self.drop_last:
-            return len(self.dataset) // self.batch_size
-        else:
-            return (len(self.dataset) + self.batch_size - 1) // self.batch_size
-    
-    def __iter__(self) -> Iterator[Dict[str, Tensor]]:
-        if self.shuffle:
-            random.shuffle(self.indices)
-        
-        for i in range(0, len(self.dataset), self.batch_size):
-            batch_indices = self.indices[i:i + self.batch_size]
-            
-            if self.drop_last and len(batch_indices) < self.batch_size:
-                continue
-            
-            batch = [self.dataset[idx] for idx in batch_indices]
-            yield self.dataset.collate_fn(batch)
+def create_loaders(path, tok, bs=1, maxlen=8192):
+  train, val = Dataset(path, tok, maxlen, "train"), Dataset(path, tok, maxlen, "validation")
+  return DataLoader(train, bs, True, True), DataLoader(val, bs, False, False)
 
-def create_data_loaders(data_dir: str, tokenizer, batch_size: int = 1, max_length: int = 8192):
-    train_dataset = GovReportDataset(
-        data_path=data_dir, 
-        tokenizer=tokenizer, 
-        max_length=max_length, 
-        split="train"
-    )
-    val_dataset = GovReportDataset(
-        data_path=data_dir, 
-        tokenizer=tokenizer, 
-        max_length=max_length, 
-        split="validation"
-    )
-    
-    train_loader = GovReportDataLoader(
-        dataset=train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        drop_last=True
-    )
-    
-    val_loader = GovReportDataLoader(
-        dataset=val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False
-    )
-    
-    return train_loader, val_loader
-
-def get_tokenizer(model_path: str = None):
-    from tinygrad import Tensor
-    from tinygrad.apps.llm import SimpleTokenizer
-    
-    if model_path and Path(model_path).exists():
-        # Load tokenizer from the actual model being fine-tuned
-        if model_path.endswith('.gguf'):
-            model_gguf = Tensor(model_path)
-        else:
-            # For safetensors/bin files, we need to look for tokenizer files
-            model_dir = Path(model_path).parent if Path(model_path).is_file() else Path(model_path)
-            tokenizer_model = model_dir / "tokenizer.model"
-            if tokenizer_model.exists():
-                # Load from sentencepiece model if available
-                import sentencepiece as spm
-                sp = spm.SentencePieceProcessor()
-                sp.load(str(tokenizer_model))
-                # Create a wrapper that mimics SimpleTokenizer interface
-                class SentencePieceTokenizer:
-                    def __init__(self, sp_model):
-                        self.sp = sp_model
-                        self.pad_token_id = sp_model.pad_id()
-                        self.bos_token_id = sp_model.bos_id() 
-                        self.eos_token_id = sp_model.eos_id()
-                    
-                    def encode(self, text: str) -> list[int]:
-                        return self.sp.encode(text, out_type=int)
-                    
-                    def decode(self, ids: list[int]) -> str:
-                        return self.sp.decode(ids)
-                
-                return SentencePieceTokenizer(sp)
-            else:
-                raise FileNotFoundError(f"No tokenizer found in {model_dir}")
+def get_tokenizer(mp=None):
+  from tinygrad import Tensor
+  from tinygrad.apps.llm import SimpleTokenizer
+  if mp and Path(mp).exists():
+    if mp.endswith('.gguf'): model_gguf = Tensor(mp)
     else:
-        # Fallback: use Llama2 tokenizer from a Llama2 GGUF model
-        # Use Llama2 7B as it has the same tokenizer as 70B but is smaller to download
-        llama2_url = "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q2_K.gguf"
-        print(f"Loading Llama2 tokenizer from {llama2_url}")
-        model_gguf = Tensor.from_url(llama2_url)
-    
-    # Load tokenizer from GGUF
-    from tinygrad.nn.state import gguf_load
-    kv, _ = gguf_load(model_gguf.to(None))
-    
-    # Create the tokenizer from GGUF key-values
-    tokenizer = SimpleTokenizer.from_gguf_kv(kv)
-    
-    # Add compatibility attributes for the training code
-    tokenizer.pad_token_id = kv.get('tokenizer.ggml.padding_token_id', 0)
-    tokenizer.bos_token_id = kv.get('tokenizer.ggml.bos_token_id', 1)
-    tokenizer.eos_token_id = kv.get('tokenizer.ggml.eos_token_id', 2)
-    
-    return tokenizer
+      mdir = Path(mp).parent if Path(mp).is_file() else Path(mp)
+      tok_model = mdir / "tokenizer.model"
+      if tok_model.exists():
+        import sentencepiece as spm
+        sp = spm.SentencePieceProcessor()
+        sp.load(str(tok_model))
+        class SPTok:
+          def __init__(self, sp): self.sp, self.pad_token_id, self.bos_token_id, self.eos_token_id = sp, sp.pad_id(), sp.bos_id(), sp.eos_id()
+          def encode(self, t): return self.sp.encode(t, out_type=int)
+          def decode(self, ids): return self.sp.decode(ids)
+        return SPTok(sp)
+      else: raise FileNotFoundError(f"no tokenizer in {mdir}")
+  else:
+    url = "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q2_K.gguf"
+    print(f"loading tok from {url}")
+    model_gguf = Tensor.from_url(url)
+  from tinygrad.nn.state import gguf_load
+  kv, _ = gguf_load(model_gguf.to(None))
+  tok = SimpleTokenizer.from_gguf_kv(kv)
+  tok.pad_token_id, tok.bos_token_id, tok.eos_token_id = kv.get('tokenizer.ggml.padding_token_id',0), kv.get('tokenizer.ggml.bos_token_id',1), kv.get('tokenizer.ggml.eos_token_id',2)
+  return tok
